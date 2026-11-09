@@ -1,0 +1,44 @@
+name: JARVIS Cloud AI
+
+on:
+  schedule:
+    - cron: "2-57/5 * * * *"   # bangun tiap ±5 menit (menit sepi 02/07/12/...57)
+  workflow_dispatch: {}        # bisa dipicu manual dari tab Actions
+
+concurrency:
+  group: jarvis-ai
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  dengar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - uses: actions/setup-node@v4
+        with: { node-version: "20" }
+
+      - name: Siklus Telegram + AI (long-polling ~4 menit)
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN_AI }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          CYCLE_MS: "240000"
+        run: node bot-ai.js
+
+      - name: Simpan offset (commit)
+        run: |
+          git config user.name "jarvis-cloud"
+          git config user.email "bot@users.noreply.github.com"
+          git add state.json
+          if git diff --cached --quiet; then
+            echo "tidak ada perubahan"
+          else
+            git commit -m "offset otomatis $(date -u '+%F %H:%M')"
+            git push
+          fi
