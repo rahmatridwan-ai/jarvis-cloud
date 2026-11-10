@@ -223,32 +223,30 @@ async function prosesUpdate(update, env) {
   console.log("perintah:", teks.slice(0, 80) || "(foto tanpa caption)")
 
   try {
-    // --- FOTO: edit via caption /edit
+    // --- FOTO: caption apa pun = perintah edit (boleh pakai /edit atau langsung instruksi)
     if (msg.photo?.length) {
       if (!teks)
         return await kirimTeks(env, chatId,
-          "📸 Foto diterima! Untuk mengedit, kirim ulang foto itu dengan caption:\n" +
-          "/edit ubah langit jadi malam penuh bintang")
-      if (/^\/edit(foto)?\b/.test(teks)) {
-        const instruksi = teks.replace(/^\/edit(foto)?\s*/, "").trim()
-        if (!instruksi)
-          return await kirimTeks(env, chatId, "Tulis instruksi edit di caption, contoh: /edit ubah jadi hitam putih")
-        await editFoto(env, chatId, msg.photo, instruksi).catch(async e => {
-          const m = String(e.message || e)
-          console.log("edit gagal:", m.slice(0, 160))
-          if (/429|quota|exceeded|RESOURCE/i.test(m))
-            await kirimTeks(env, chatId,
-              "⏳ Kuota edit foto gratisan sedang habis (kuota AI harian).\n" +
-              "Biasanya terbuka lagi antara 1–6 jam — coba ulang nanti ya.\n\n" +
-              "💡 Opsi cepat lain:\n" +
-              "• Edit dasar (b&w, sepia, cerah, crop) → /video menu di bot PC @darksystemjarvis_bot (FFmpeg, PC nyala)\n" +
-              "• Sementara: AI Studio web https://aistudio.google.com (login Google, gratis di browser)")
-          else
-            await kirimTeks(env, chatId, "❌ Edit gagal: " + m.slice(0, 200))
-        })
-        return
-      }
-      return await kirimTeks(env, chatId, "📸 Foto diterima. Balas foto itu dengan caption /edit <instruksi> supaya saya edit.")
+          "📸 Foto diterima! Balas/kirim ulang foto itu dengan CAPTION berisi instruksi edit.\n" +
+          "Contoh: ubah jadi suasana senja dramatis tanpa harus menulis /edit \n\n" +
+          "(opsional: awali dengan /edit, hasilnya sama)")
+      const instruksi = teks.replace(/^\/edit(foto)?\s*/, "").trim()
+      if (!instruksi || (teks.startsWith("/") && !/^\/edit/.test(teks)))
+        return await kirimTeks(env, chatId, "Tulis instruksi edit di caption, contoh: ubah jadi hitam putih")
+      await editFoto(env, chatId, msg.photo, instruksi).catch(async e => {
+        const m = String(e.message || e)
+        console.log("edit gagal:", m.slice(0, 160))
+        if (/429|quota|exceeded|RESOURCE/i.test(m))
+          await kirimTeks(env, chatId,
+            "⏳ Kuota edit foto gratisan sedang habis (kuota AI harian).\n" +
+            "Biasanya terbuka lagi antara 1–6 jam — coba ulang nanti ya.\n\n" +
+            "💡 Opsi cepat lain:\n" +
+            "• Edit dasar (b&w, sepia, cerah, crop) → /video menu di bot PC @darksystemjarvis_bot (FFmpeg, PC nyala)\n" +
+            "• Sementara: AI Studio web https://aistudio.google.com (login Google, gratis di browser)")
+        else
+          await kirimTeks(env, chatId, "❌ Edit gagal: " + m.slice(0, 200))
+      })
+      return
     }
 
     if (!teks) return
