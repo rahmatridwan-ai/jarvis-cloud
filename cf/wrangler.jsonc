@@ -1,5 +1,6 @@
 {
   "name": "jarvis-instant",
   "main": "src/worker.js",
-  "compatibility_date": "2026-10-01"
+  "compatibility_date": "2026-10-01",
+  "ai": { "binding": "AI" }
 }
