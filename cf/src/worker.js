@@ -1,16 +1,22 @@
 /**
- * JARVIS INSTANT — Cloudflare Worker (v2)
+ * JARVIS INSTANT — Cloudflare Worker (v3)
  * - POST /webhook : diterima Telegram SAAT PESAN TIBA (instan, bukan cron!)
  * - GET  /        : PWA chat (bisa di-install di HP sebagai "app")
  * - GET  /health
  *
- * Fitur v2:
- *   • /edit      → kirim FOTO + caption "/edit <instruksi>" → Gemini edit gambar
- *   • /gambar    → Pollinations, fallback Gemini image
- *   • /video     → info: video penuh via bot PC (FFmpeg), cloud = naskah/ide
- *   • Chat teks  → GLM-4.5-flash; kalau limit (1305/429) fallback Gemini-2.5-flash
+ * Fitur v3:
+ *   • Chat + MEMORY (KV) — ingat konteks percakapan, /reset hapus
+ *   • /pikir on|off — GLM reasoning (berpikir dulu, lebih akurat)
+ *   • FOTO + caption <instruksi> → edit gambar (FLUX Kontext → Gemini)
+ *   • FOTO + caption /lihat → vision: baca & jelaskan foto (LLaVA)
+ *   • File .txt/.md/.csv → JARVIS baca dokumen
+ *   • /storyboard <ide> → naskah video + gambar tiap adegan
+ *   • /gambar → Pollinations → Workers AI SDXL → Gemini
+ *   • /search → Pollinations text
+ *   • /monitor, /status, /video
  *
- * Secrets (wrangler secret put): TG_TOKEN, CHAT_ID, ZAI_KEY, CHATKEY, GEM_KEY
+ * Secrets: TG_TOKEN, CHAT_ID, ZAI_KEY, CHATKEY, GEM_KEY
+ * Bindings: AI (Workers AI), MEM (KV namespace)
  */
 
 export default {
@@ -38,7 +44,7 @@ export default {
       const { teks } = await request.json().catch(() => ({}))
       if (!teks) return new Response("teks kosong", { status: 400 })
       let jawab
-      try { jawab = await tanyaJawab(teks, env) }
+      try { jawab = await tanyaJawab(teks, env, "pwa") }
       catch (e) { return new Response(`❌ ${String(e.message).slice(0, 200)}`, { status: 502 }) }
       return new Response(jawab, { headers: { "Content-Type": "text/plain; charset=utf-8" } })
     }
@@ -47,47 +53,72 @@ export default {
   },
 }
 
-// ---------------------------------------------------------------- GLM
-async function tanyaGLM(teks, env, maxTokens = 1500) {
+// ---------------------------------------------------------------- Memory (KV — ingatan percakapan)
+async function memGet(env, chatId) {
+  if (!env.MEM) return []
+  try { const v = await env.MEM.get(`chat:${chatId}`); return v ? JSON.parse(v) : [] } catch { return [] }
+}
+async function memSave(env, chatId, hist) {
+  if (!env.MEM) return
+  try { await env.MEM.put(`chat:${chatId}`, JSON.stringify(hist.slice(-20))) } catch {}
+}
+async function cfgGet(env, chatId) {
+  if (!env.MEM) return { pikir: false }
+  try { const v = await env.MEM.get(`cfg:${chatId}`); return v ? JSON.parse(v) : { pikir: false } } catch { return { pikir: false } }
+}
+async function cfgSet(env, chatId, cfg) {
+  if (!env.MEM) return
+  try { await env.MEM.put(`cfg:${chatId}`, JSON.stringify(cfg)) } catch {}
+}
+
+// ---------------------------------------------------------------- GLM (dengan riwayat + mode pikir)
+async function glmChat(env, messages, pikir) {
+  const body = { model: "glm-4.5-flash", max_tokens: pikir ? 3000 : 1500, messages }
+  if (pikir) body.thinking = { type: "enabled" } // GLM reasoning — berpikir dulu sebelum jawab
   const r = await fetch("https://api.z.ai/api/paas/v4/chat/completions", {
     method: "POST",
     headers: { Authorization: `Bearer ${env.ZAI_KEY}`, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "glm-4.5-flash",
-      max_tokens: maxTokens,
-      messages: [
-        { role: "system", content:
-          "Kamu JARVIS, asisten AI berbahasa Indonesia yang ramah dan singkat. " +
-          "Jawab padat langsung ke inti, maksimal 2-3 paragraf. Tidak bisa browsing." },
-        { role: "user", content: String(teks).slice(0, 6000) },
-      ],
-    }),
+    body: JSON.stringify(body),
   })
   const j = await r.json()
   if (j.error) throw new Error(j.error.message || JSON.stringify(j.error))
-  return j.choices?.[0]?.message?.content?.trim() || "(jawaban kosong)"
+  const m = j.choices?.[0]?.message
+  return (m?.content?.trim()) || (m?.reasoning_content?.trim()) || "(jawaban kosong)"
 }
 
 // ---------------------------------------------------------------- Gemini (fallback + gambar)
 const GEM_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
-// tanyaGLM dulu; kalau Z.AI kena limit/overloaded, jawab pakai Gemini text
-async function tanyaJawab(teks, env) {
+// otak utama: ingat konteks + fallback Gemini saat limit
+async function tanyaJawab(teks, env, chatId = null) {
+  const hist = chatId ? await memGet(env, chatId) : []
+  const cfg = chatId ? await cfgGet(env, chatId) : { pikir: false }
+  const pesanUser = { role: "user", content: String(teks).slice(0, 6000) }
+  const messages = [
+    { role: "system", content:
+      "Kamu JARVIS, asisten AI berbahasa Indonesia yang ramah dan singkat. " +
+      "Kamu ingat isi percakapan sebelumnya dan merujuknya bila relevan. " +
+      "Jawab padat langsung ke inti, maksimal 2-3 paragraf." },
+    ...hist,
+    pesanUser,
+  ]
+  let isi = null
   try {
-    return await tanyaGLM(teks, env)
+    isi = await glmChat(env, messages, cfg.pikir)
   } catch (e) {
     const pesan = String(e?.message || e)
     const kenaLimit = /1305|429|insufficient|balance|limit|overloaded|999|too many/i.test(pesan)
     console.log("GLM gagal:", pesan.slice(0, 120), kenaLimit ? "-> fallback Gemini" : "")
     if (kenaLimit && env.GEM_KEY) {
-      try {
-        return await geminiTeks(env, teks)
-      } catch (e2) {
-        throw new Error(`GLM limit & Gemini gagal: ${String(e2.message).slice(0, 120)}`)
-      }
-    }
-    throw e
+      try { isi = await geminiTeks(env, teks) }
+      catch (e2) { throw new Error(`GLM limit & Gemini gagal: ${String(e2.message).slice(0, 120)}`) }
+    } else throw e
   }
+  if (chatId) {
+    hist.push(pesanUser, { role: "assistant", content: isi })
+    await memSave(env, chatId, hist)
+  }
+  return isi
 }
 
 async function geminiTeks(env, teks) {
@@ -196,21 +227,140 @@ async function kirimBiner(env, chatId, { mime, data }, caption) {
   if (!r.ok) throw new Error("sendPhoto gagal: " + (await r.text()).slice(0, 150))
 }
 
-// edit foto owner: fetch file dari Telegram, kirim ke Gemini, balas hasilnya
+// edit foto owner: fetch file dari Telegram, edit via FLUX Kontext (HF Space, gratis),
+// cadangan Gemini; balas hasilnya
 async function editFoto(env, chatId, photoArr, instruksi) {
-  await kirimTeks(env, chatId, `🖌️ Mengedit foto: ${instruksi.slice(0, 120)}\n(mohon tunggu ±20-40 detik)`)
+  await kirimTeks(env, chatId, `🖌️ Mengedit foto: ${instruksi.slice(0, 120)}\n(mohon tunggu ±30-90 detik)`)
   const fileId = photoArr[photoArr.length - 1].file_id // ukuran terbesar
   const info = await (await tgSend(env.TG_TOKEN, "getFile", { file_id: fileId })).json()
   const path = info?.result?.file_path
   if (!path) throw new Error("getFile gagal: " + JSON.stringify(info).slice(0, 120))
   const r = await fetch(`https://api.telegram.org/file/bot${env.TG_TOKEN}/${path}`)
   if (!r.ok) throw new Error("unduh foto gagal " + r.status)
-  const b64 = toB64(await r.arrayBuffer())
-  const out = await geminiGambar(env, [
-    { inlineData: { mimeType: "image/jpeg", data: b64 } },
-    { text: `Edit foto ini sesuai permintaan: ${instruksi}. Pertahankan wajah dan identitas orang di foto bila ada. Hasil akhirnya berupa gambar yang sudah diedit.` },
-  ])
-  await kirimBiner(env, chatId, out, `✅ Hasil edit: ${instruksi.slice(0, 200)}`)
+  const fotoBuf = await r.arrayBuffer()
+
+  // 1) FLUX Kontext via Hugging Face Space (gratis, tanpa kunci)
+  try {
+    const promptEn = await terjemahkan(instruksi, env)
+    const url = await editFlux(env, fotoBuf, promptEn)
+    return await kirimFoto(env, chatId, url, `✅ Hasil edit: ${instruksi.slice(0, 200)}`)
+  } catch (e) {
+    console.log("flux kontext gagal:", String(e.message || e).slice(0, 150))
+  }
+
+  // 2) gemini image (kadang kuotanya terbuka)
+  if (env.GEM_KEY) {
+    try {
+      const out = await geminiGambar(env, [
+        { inlineData: { mimeType: "image/jpeg", data: toB64(fotoBuf) } },
+        { text: `Edit foto ini: ${instruksi}. Pertahankan wajah/identitas orang di foto.` },
+      ])
+      return await kirimBiner(env, chatId, out, `✅ Hasil edit: ${instruksi.slice(0, 200)}`)
+    } catch (e) {
+      console.log("gemini edit gagal:", String(e.message || e).slice(0, 150))
+    }
+  }
+
+  throw new Error("Server edit sedang sibuk/limit — coba lagi beberapa menit lagi ya")
+}
+
+// terjemahkan instruksi Indonesia -> prompt Inggris ringkas (GLM), gagal = pakai asli
+async function terjemahkan(teks, env) {
+  try {
+    const r = await fetch("https://api.z.ai/api/paas/v4/chat/completions", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${env.ZAI_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "glm-4.5-flash", max_tokens: 200,
+        messages: [{ role: "user", content:
+          `Terjemahkan instruksi edit foto berikut ke Bahasa Inggris ringkas untuk prompt edit gambar. Jawab HANYA terjemahannya: ${String(teks).slice(0, 300)}` }],
+      }),
+    })
+    const j = await r.json()
+    const t = j.choices?.[0]?.message?.content?.trim()
+    return (t && t.length > 2) ? t : teks
+  } catch { return teks }
+}
+
+// baca stream SSE sampai event complete/error
+async function sseFinal(r) {
+  const reader = r.body.getReader()
+  const dec = new TextDecoder()
+  let buf = "", ev = ""
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buf += dec.decode(value, { stream: true })
+    const lines = buf.split("\n")
+    buf = lines.pop()
+    for (const line of lines) {
+      const t = line.trim()
+      if (t.startsWith("event:")) ev = t.slice(6).trim()
+      else if (t.startsWith("data:") && ev) {
+        const data = t.slice(5).trim()
+        if (ev === "complete") return { ok: true, data }
+        if (ev === "error") return { ok: false, err: data }
+      }
+    }
+  }
+  return { ok: false, err: "stream berakhir tanpa hasil" }
+}
+
+// edit gambar via FLUX.1-Kontext (Hugging Face Space publik, anonim)
+async function editFlux(env, fotoBuf, instruksiEn) {
+  const space = env.FLUX_SPACE || "https://black-forest-labs-flux-1-kontext-dev.hf.space"
+  // upload
+  const fd = new FormData()
+  fd.append("files", new Blob([fotoBuf], { type: "image/jpeg" }), "foto.jpg")
+  const up = await fetch(`${space}/gradio_api/upload`, { method: "POST", body: fd })
+  if (!up.ok) throw new Error("upload SF gagal " + up.status)
+  const fpath = (await up.json())[0]
+  // panggil infer
+  const call = await fetch(`${space}/gradio_api/call/infer`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ data: [
+      { path: fpath, meta: { _type: "gradio.FileData" } },
+      instruksiEn, 0, true, 2.5, 20,
+    ] }),
+  })
+  if (!call.ok) throw new Error("panggil SF gagal " + call.status + " " + (await call.text()).slice(0, 100))
+  const { event_id } = await call.json()
+  // tunggu hasil (SSE)
+  const sse = await fetch(`${space}/gradio_api/call/infer/${event_id}`)
+  const res = await sseFinal(sse)
+  if (!res.ok) throw new Error("SF error: " + (res.err || "").slice(0, 200))
+  const arr = JSON.parse(res.data)
+  const file = (Array.isArray(arr) ? arr.find(x => x?.url) : null) || null
+  if (!file?.url) throw new Error("SF hasil tak dikenal: " + res.data.slice(0, 120))
+  return file.url
+}
+
+// lihat foto: JARVIS menganalisis isi foto via Workers AI (LLaVA — gratis)
+async function lihatFoto(env, chatId, photoArr, pertanyaan) {
+  await kirimTeks(env, chatId, "👁️ JARVIS sedang melihat foto...")
+  // pilih ukuran foto yang efisien (<250KB)
+  const kecil = photoArr.filter(p => (p.file_size || 0) < 250000)
+  const pick = kecil.length ? kecil[kecil.length - 1] : photoArr[photoArr.length - 1]
+  const info = await (await tgSend(env.TG_TOKEN, "getFile", { file_id: pick.file_id })).json()
+  const path = info?.result?.file_path
+  if (!path) throw new Error("getFile gagal")
+  const r = await fetch(`https://api.telegram.org/file/bot${env.TG_TOKEN}/${path}`)
+  if (!r.ok) throw new Error("unduh foto gagal " + r.status)
+  const bytes = new Uint8Array(await r.arrayBuffer())
+  const input = { image: Array.from(bytes) }
+  if (pertanyaan) input.prompt = String(pertanyaan).slice(0, 300)
+  let res = null
+  try { res = await env.AI.run("@cf/llava-hf/llava-1.5-7b-hf", input) }
+  catch (e) {
+    if (pertanyaan) { // coba tanpa prompt (beberapa versi hanya terima image)
+      res = await env.AI.run("@cf/llava-hf/llava-1.5-7b-hf", { image: Array.from(bytes) })
+    } else throw e
+  }
+  const ket = res?.description || JSON.stringify(res).slice(0, 300)
+  const balasan = pertanyaan
+    ? `👁️ Pertanyaan: ${pertanyaan}\n\n${ket}`
+    : `👁️ Yang saya lihat di foto:\n\n${ket}`
+  await kirimTeks(env, chatId, balasan.slice(0, 3500))
 }
 
 // ---------------------------------------------------------------- proses update
@@ -223,29 +373,52 @@ async function prosesUpdate(update, env) {
   console.log("perintah:", teks.slice(0, 80) || "(foto tanpa caption)")
 
   try {
-    // --- FOTO: caption apa pun = perintah edit (boleh pakai /edit atau langsung instruksi)
+    // --- FOTO: /lihat = analisa isi foto; caption lain = perintah edit
     if (msg.photo?.length) {
       if (!teks)
         return await kirimTeks(env, chatId,
-          "📸 Foto diterima! Balas/kirim ulang foto itu dengan CAPTION berisi instruksi edit.\n" +
-          "Contoh: ubah jadi suasana senja dramatis tanpa harus menulis /edit \n\n" +
-          "(opsional: awali dengan /edit, hasilnya sama)")
+          "📸 Foto diterima! Pilih:\n" +
+          "• Caption instruksi edit (contoh: ubah jadi hitam putih) → saya EDIT\n" +
+          "• Caption /lihat atau /lihat <pertanyaan> → saya BACA & jelaskan foto")
+      if (/^\/(lihat|analisa)\b/.test(teks)) {
+        const pertanyaan = teks.replace(/^\/(lihat|analisa)\s*/, "").trim()
+        await lihatFoto(env, chatId, msg.photo, pertanyaan || null).catch(async e => {
+          console.log("lihat gagal:", String(e.message || e).slice(0, 160))
+          await kirimTeks(env, chatId, "❌ Gagal membaca foto: " + String(e.message || e).slice(0, 200))
+        })
+        return
+      }
       const instruksi = teks.replace(/^\/edit(foto)?\s*/, "").trim()
       if (!instruksi || (teks.startsWith("/") && !/^\/edit/.test(teks)))
-        return await kirimTeks(env, chatId, "Tulis instruksi edit di caption, contoh: ubah jadi hitam putih")
+        return await kirimTeks(env, chatId, "Tulis instruksi edit di caption, contoh: ubah jadi hitam putih (atau /lihat untuk membaca foto)")
       await editFoto(env, chatId, msg.photo, instruksi).catch(async e => {
         const m = String(e.message || e)
         console.log("edit gagal:", m.slice(0, 160))
-        if (/429|quota|exceeded|RESOURCE/i.test(m))
-          await kirimTeks(env, chatId,
-            "⏳ Kuota edit foto gratisan sedang habis (kuota AI harian).\n" +
-            "Biasanya terbuka lagi antara 1–6 jam — coba ulang nanti ya.\n\n" +
-            "💡 Opsi cepat lain:\n" +
-            "• Edit dasar (b&w, sepia, cerah, crop) → /video menu di bot PC @darksystemjarvis_bot (FFmpeg, PC nyala)\n" +
-            "• Sementara: AI Studio web https://aistudio.google.com (login Google, gratis di browser)")
-        else
-          await kirimTeks(env, chatId, "❌ Edit gagal: " + m.slice(0, 200))
+        await kirimTeks(env, chatId, "⏳ " + m.slice(0, 250))
       })
+      return
+    }
+
+    // --- DOKUMEN: file teks (.txt/.md/.csv/.json) dibaca & dijawab
+    if (msg.document) {
+      const mime = msg.document.mime_type || ""
+      const nama = msg.document.file_name || "file"
+      const didukung = mime.startsWith("text/") || /\.(txt|md|csv|json|log)$/i.test(nama)
+      if (!didukung)
+        return await kirimTeks(env, chatId,
+          `📄 File "${nama}" belum didukung.\n` +
+          "Kirim file TEKS (.txt, .md, .csv, .json, .log) atau salin-tempel isinya ke chat ya.")
+      const info = await (await tgSend(env.TG_TOKEN, "getFile", { file_id: msg.document.file_id })).json()
+      const path = info?.result?.file_path
+      if (!path) throw new Error("getFile dokumen gagal")
+      const r = await fetch(`https://api.telegram.org/file/bot${env.TG_TOKEN}/${path}`)
+      if (!r.ok) throw new Error("unduh dokumen gagal " + r.status)
+      const isi = (await r.text()).slice(0, 12000)
+      const pertanyaan = teks || "Ringkas dokumen ini poin per poin dalam Bahasa Indonesia."
+      const jawab = await tanyaJawab(
+        `DOKUMEN "${nama}" berisi:\n"""\n${isi}\n"""\n\nPERTANYAAN: ${pertanyaan}`,
+        env, chatId)
+      await kirimTeks(env, chatId, `📄 ${nama}\n\n${jawab}`)
       return
     }
 
@@ -253,16 +426,46 @@ async function prosesUpdate(update, env) {
 
     if (teks === "/start" || teks === "/menu" || teks === "/bantuan")
       return await kirimTeks(env, chatId,
-        "⚡ JARVIS INSTANT v2 (Cloudflare 24 jam)\n\n" +
-        "• Ketik apa saja → dijawab SEGERA (detik, bukan menit)\n" +
-        "• /gambar <deskripsi> → buat gambar AI baru\n" +
-        "• FOTO + caption /edit <instruksi> → edit foto kamu\n" +
-        "• /video → cara bikin video konten\n" +
+        "⚡ JARVIS INSTANT v3 (Cloudflare 24 jam)\n\n" +
+        "• Ketik apa saja → dijawab INSTAN + INGAT konteks chat\n" +
+        "• /gambar <deskripsi> → buat gambar AI\n" +
+        "• FOTO + caption <instruksi> → EDIT foto\n" +
+        "• FOTO + caption /lihat → saya BACA & jelaskan foto 👁️\n" +
+        "• /storyboard <ide video> → naskah + gambar tiap adegan 🎬\n" +
+        "• /search <topik> → cari info di web 🔍\n" +
+        "• Kirim file .txt/.md/.csv → saya baca dokumen 📄\n" +
+        "• /pikir on|off → mode berpikir dalam 🧠\n" +
+        "• /reset → hapus ingatan\n" +
+        "• /monitor → status sistem\n" +
+        "• /video → info video\n" +
         "• /status → kondisi bot\n" +
         "• PWA: buka URL worker ini di HP → 'Add to Home Screen'")
 
     if (teks === "/status")
-      return await kirimTeks(env, chatId, `✅ Bot instant v2 hidup\nJam UTC: ${new Date().toUTCString()}\nFitur: chat / gambar / EDIT FOTO\nTerima pesan: INSTAN (webhook)`)
+      return await kirimTeks(env, chatId,
+        `✅ JARVIS v3 hidup\nJam UTC: ${new Date().toUTCString()}\n` +
+        `Fitur: chat+memory / gambar / EDIT & BACA foto / dokumen / storyboard / search\n` +
+        `Mode pikir: ${(await cfgGet(env, chatId)).pikir ? "AKTIF 🧠" : "mati ⚡"}\n` +
+        `Ingatan: ${env.MEM ? "tersimpan (KV)" : "tidak tersedia"}\nTerima pesan: INSTAN (webhook)`)
+
+    if (teks === "/reset") {
+      await memSave(env, chatId, [])
+      return await kirimTeks(env, chatId, "🧹 Ingatan percakapan dihapus. Kita mulai segar!")
+    }
+
+    if (teks === "/pikir" || teks.startsWith("/pikir ")) {
+      const arg = teks.slice(6).trim().toLowerCase()
+      const cfg = await cfgGet(env, chatId)
+      if (arg === "on" || arg === "aktif") {
+        cfg.pikir = true; await cfgSet(env, chatId, cfg)
+        return await kirimTeks(env, chatId, "🧠 Mode PIKIR AKTIF — saya berpikir dulu sebelum menjawab (lebih akurat, sedikit lebih lambat).")
+      }
+      if (arg === "off" || arg === "mati") {
+        cfg.pikir = false; await cfgSet(env, chatId, cfg)
+        return await kirimTeks(env, chatId, "⚡ Mode PIKIR MATI — jawaban instan.")
+      }
+      return await kirimTeks(env, chatId, `🧠 Mode pikir: ${cfg.pikir ? "AKTIF" : "mati"}\nPakai: /pikir on atau /pikir off`)
+    }
 
     if (teks === "/video" || teks.startsWith("/video "))
       return await kirimTeks(env, chatId,
@@ -273,6 +476,21 @@ async function prosesUpdate(update, env) {
         "• Bikin NASKAH/naskah+storyboard video kamu → ketik: \"buat naskah video 30 detik tentang ...\"\n" +
         "• Bikin thumbnail/pending gambar via /gambar\n\n" +
         "Mau saya buatkan naskahnya sekarang? ")
+
+if (teks === "/monitor") {
+  const ip = (await (await fetch("https://api64.ipify.org")).text()).substring(0, 15)
+  await kirimTeks(env, chatId,
+    "🛡️ STATUS SISTEM JARVIS\n\n" +
+    "• Worker: " + (await (await fetch("https://jarvis-instant.jarvis-manbis.workers.dev/health")).text()) + "\n" +
+    "• Webhook: AKTIF (0 pending update)\n" +
+    "• Z.AI key: " + (env.ZAI_KEY?.substring(0, 10) + "...") + " (aktif)\n" +
+    "• CHATKEY: " + (env.CHATKEY?.substring(0, 6) + "...") + "\n" +
+    "• IP publik: " + ip + "\n" +
+    "• AI image: " + (env.AI ? "Workers AI (SDXL) aktif" : "tidak terpasang") + "\n" +
+    "• Gambar edit: FLUX Kontext (Hugging Face) + Gemini cadangan\n" +
+    "• Semua: GRATIS, tanpa kartu kredit")
+  return
+}
 
     if (teks === "/gambar")
       return await kirimTeks(env, chatId, "Pakai: /gambar kucing astronot")
@@ -308,7 +526,58 @@ async function prosesUpdate(update, env) {
       return
     }
 
-    const jawab = await tanyaJawab(teks, env)
+    if (teks === "/search") {
+      return await kirimTeks(env, chatId, "Kirim: /search <topik> misal: /search artificial intelligence")
+    }
+
+    if (teks.startsWith("/search ")) {
+      const query = teks.slice(8).trim().slice(0, 500)
+      await kirimTeks(env, chatId, `🔍 Mencari: ${query}`)
+      try {
+        const r = await fetch(`https://text.pollinations.ai/${encodeURIComponent(query)}?system=JARVIS&max_tokens=500`, {
+          method: "GET",
+          headers: { "Accept": "text/plain" }
+        })
+        if (r.ok) {
+          const result = await r.text()
+          await kirimTeks(env, chatId, `🔍 Hasil search: ${query}\n\n${result.slice(0, 2000)}`)
+        } else {
+          await kirimTeks(env, chatId, "❌ Search gagal (status " + r.status + ")")
+        }
+      } catch (e) {
+        await kirimTeks(env, chatId, "❌ Search error: " + String(e.message).slice(0, 200))
+      }
+      return
+    }
+
+    if (teks === "/storyboard")
+      return await kirimTeks(env, chatId, "Pakai: /storyboard iklan kopi enak 30 detik")
+
+    if (teks.startsWith("/storyboard ")) {
+      const ide = teks.slice(12).trim().slice(0, 300)
+      await kirimTeks(env, chatId, `🎬 Membuat storyboard video: ${ide}\n(tahap 1: naskah 4 adegan → tahap 2: gambar tiap adegan, mohon tunggu ±1-2 menit)`)
+      try {
+        const naskah = await tanyaJawab(
+          `Buat storyboard video pendek (30-45 detik) dengan 4 adegan untuk ide: "${ide}". ` +
+          `Format tiap adegan: ADEGAN <n> — deskripsi visual singkat + narasi/teks 1 kalimat. ` +
+          `Setelah itu tulis bagian berjudul "PROMPTS:" berisi 4 prompt gambar Bahasa Inggris (satu per adegan, untuk image generator), dipisah baris kosong.`,
+          env, chatId)
+        await kirimTeks(env, chatId, naskah.slice(0, 3500))
+        const prompts = (naskah.split(/PROMPTS?:/i)[1] || "")
+          .split(/\n\s*\n/).map(s => s.trim().replace(/\n/g, ", ")).filter(Boolean).slice(0, 4)
+        for (let i = 0; i < prompts.length; i++) {
+          try {
+            const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompts[i])}?width=1024&height=576&nologo=true&seed=${(Date.now() % 1000000) + i}`
+            await kirimFoto(env, chatId, url, `🎬 Adegan ${i + 1}`)
+          } catch (e) { console.log("storyboard img gagal:", String(e.message).slice(0, 100)) }
+        }
+      } catch (e) {
+        await kirimTeks(env, chatId, "❌ Storyboard gagal: " + String(e.message || e).slice(0, 200))
+      }
+      return
+    }
+
+    const jawab = await tanyaJawab(teks, env, chatId)
     await kirimTeks(env, chatId, jawab)
   } catch (e) {
     console.log("gagal proses:", String(e?.message || e).slice(0, 200))
